@@ -7,6 +7,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
@@ -44,6 +46,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.components.containers.Detection
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
@@ -51,15 +54,62 @@ import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetectorResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.BufferedInputStream
-import java.io.ByteArrayOutputStream
+import java.io.DataInputStream
+import java.io.InputStream
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+private val TRADUCCIONES_OBJETOS = mapOf(
+    "person" to "Persona",
+    "car" to "Auto",
+    "truck" to "Camioneta / Camión",
+    "bus" to "Autobús",
+    "motorcycle" to "Moto",
+    "bicycle" to "Bicicleta",
+    "dog" to "Perro",
+    "cat" to "Gato",
+    "chair" to "Silla",
+    "bench" to "Banca",
+    "fire hydrant" to "Hidrante",
+    "stop sign" to "Señal de alto",
+    "backpack" to "Mochila",
+    "suitcase" to "Maleta",
+    "potted plant" to "Maceta",
+    "bottle" to "Botella",
+    "cup" to "Vaso / Taza",
+    "cell phone" to "Celular",
+    "laptop" to "Laptop"
+)
+
+private fun obtenerObjetoMasCercano(
+    detections: List<Detection>,
+    imageWidth: Int,
+    imageHeight: Int
+): Pair<Detection, String>? {
+    if (detections.isEmpty() || imageWidth <= 0 || imageHeight <= 0) return null
+
+    // Prioriza objetos dentro del cono horizontal central donde apunta el sensor ultrasónico
+    val enConoCentral = detections.filter { detection ->
+        val box = detection.boundingBox()
+        val centroXNorm = ((box.left + box.right) / 2f) / imageWidth.toFloat()
+        centroXNorm in 0.15f..0.85f
+    }
+
+    val candidatos = enConoCentral.ifEmpty { detections }
+
+    // Por perspectiva de cámara de reversa, el borde inferior más bajo corresponde al objeto más próximo
+    val masCercano = candidatos.maxByOrNull { it.boundingBox().bottom } ?: return null
+    val rawName = masCercano.categories().firstOrNull()?.categoryName() ?: return null
+    val nombreTraducido = TRADUCCIONES_OBJETOS[rawName.lowercase(Locale.ROOT)] ?: rawName
+
+    return Pair(masCercano, nombreTraducido)
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -102,17 +152,26 @@ fun PermissionWrapper() {
     }
 }
 
+private fun readHeaderLine(input: InputStream): String? {
+    val sb = StringBuilder(64)
+    while (true) {
+        val b = input.read()
+        if (b == -1) return if (sb.isEmpty()) null else sb.toString()
+        if (b == '\n'.code) break
+        if (b != '\r'.code) sb.append(b.toChar())
+    }
+    return sb.toString()
+}
+
 @Composable
 fun MainCameraScreen() {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     val urlStreamEsp32 = "http://192.168.4.1/stream"
     val urlDistanceEsp32 = "http://192.168.4.1:81/distance"
-    val urlBuzzerBase = "http://192.168.4.1:81/buzzer"
 
     var usarCamaraLocal by remember { mutableStateOf(false) }
-    var buzzerMuted by remember { mutableStateOf(false) }
+    var soundMuted by remember { mutableStateOf(false) }
     var currentFrame by remember { mutableStateOf<Bitmap?>(null) }
     var detectionResults by remember { mutableStateOf<ObjectDetectorResult?>(null) }
     var imageSize by remember { mutableStateOf(Pair(1, 1)) }
@@ -129,79 +188,80 @@ fun MainCameraScreen() {
         )
     }
 
-    DisposableEffect(Unit) {
-        onDispose { detectorHelper.close() }
+    val toneGenerator = remember {
+        try {
+            ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    // 1. Lector continuo del stream MJPEG de la ESP32-S3
+    DisposableEffect(Unit) {
+        onDispose {
+            detectorHelper.close()
+            toneGenerator?.stopTone()
+            toneGenerator?.release()
+        }
+    }
+
+    // 1. Lector de bloques de alta velocidad para el stream MJPEG de la ESP32-S3
     LaunchedEffect(usarCamaraLocal) {
         if (!usarCamaraLocal) {
             val client = OkHttpClient.Builder()
                 .readTimeout(0, TimeUnit.MILLISECONDS)
                 .build()
             val request = Request.Builder().url(urlStreamEsp32).build()
+            val reusableBuffer = ByteArray(256 * 1024)
 
             while (isActive) {
                 withContext(Dispatchers.IO) {
                     try {
                         client.newCall(request).execute().use { response ->
                             val body = response.body ?: return@use
-                            val inputStream = BufferedInputStream(body.byteStream(), 16384)
-                            val jpegBuffer = ByteArrayOutputStream()
-                            var prevByte = -1
-                            var insideJpeg = false
+                            val dataInput = DataInputStream(BufferedInputStream(body.byteStream(), 32768))
 
                             var frameCount = 0
                             var lastFpsTime = SystemClock.elapsedRealtime()
 
                             while (isActive) {
-                                val currByte = inputStream.read()
-                                if (currByte == -1) break
+                                val line = readHeaderLine(dataInput) ?: break
+                                if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                                    val length = line.substringAfter(":").trim().toIntOrNull() ?: continue
+                                    if (length !in 100..reusableBuffer.size) continue
 
-                                if (!insideJpeg) {
-                                    if (prevByte == 0xFF && currByte == 0xD8) {
-                                        insideJpeg = true
-                                        jpegBuffer.reset()
-                                        jpegBuffer.write(0xFF)
-                                        jpegBuffer.write(0xD8)
+                                    while (isActive) {
+                                        val blank = readHeaderLine(dataInput) ?: break
+                                        if (blank.isEmpty()) break
                                     }
-                                } else {
-                                    jpegBuffer.write(currByte)
-                                    if (prevByte == 0xFF && currByte == 0xD9) {
-                                        insideJpeg = false
-                                        val bytes = jpegBuffer.toByteArray()
-                                        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-                                        if (bitmap != null) {
-                                            frameCount++
-                                            val now = SystemClock.elapsedRealtime()
-                                            if (now - lastFpsTime >= 1000L) {
-                                                val fpsCalc = frameCount
-                                                frameCount = 0
-                                                lastFpsTime = now
-                                                withContext(Dispatchers.Main) { videoFps = fpsCalc }
-                                            }
+                                    dataInput.readFully(reusableBuffer, 0, length)
+                                    val bitmap = BitmapFactory.decodeByteArray(reusableBuffer, 0, length)
 
-                                            withContext(Dispatchers.Main) {
-                                                currentFrame = bitmap
-                                            }
-                                            detectorHelper.detectLiveStream(bitmap)
+                                    if (bitmap != null) {
+                                        frameCount++
+                                        val now = SystemClock.elapsedRealtime()
+                                        if (now - lastFpsTime >= 1000L) {
+                                            videoFps = frameCount
+                                            frameCount = 0
+                                            lastFpsTime = now
                                         }
+
+                                        currentFrame = bitmap
+                                        detectorHelper.detectLiveStream(bitmap)
                                     }
                                 }
-                                prevByte = currByte
                             }
                         }
                     } catch (_: Exception) {
-                        withContext(Dispatchers.Main) { videoFps = 0 }
+                        videoFps = 0
                     }
                 }
-                delay(300)
+                delay(250)
             }
         }
     }
 
-    // 2. Lectura paralela de distancia del sensor ultrasónico (puerto 81)
+    // 2. Consulta de distancia del sensor ultrasónico cada 1 segundo (puerto 81)
     LaunchedEffect(usarCamaraLocal) {
         if (!usarCamaraLocal) {
             val distClient = OkHttpClient.Builder()
@@ -215,22 +275,63 @@ fun MainCameraScreen() {
                     try {
                         distClient.newCall(distRequest).execute().use { response ->
                             val text = response.body?.string()?.trim()
-                            val parsed = text?.toIntOrNull() ?: -1
-                            withContext(Dispatchers.Main) {
-                                distanceCm = parsed
-                            }
+                            distanceCm = text?.toIntOrNull() ?: -1
                         }
                     } catch (_: Exception) {
-                        withContext(Dispatchers.Main) {
-                            distanceCm = -1
-                        }
+                        distanceCm = -1
                     }
                 }
-                delay(100)
+                delay(1000)
             }
         } else {
             distanceCm = -1
         }
+    }
+
+    // 3. Alerta sonora progresiva en el celular (<= 65 cm pita más rápido, <= 20 cm continuo)
+    LaunchedEffect(soundMuted, usarCamaraLocal) {
+        var isContinuousPlaying = false
+
+        try {
+            while (isActive) {
+                val dist = distanceCm
+                if (soundMuted || usarCamaraLocal || dist !in 5..65 || toneGenerator == null) {
+                    if (isContinuousPlaying) {
+                        toneGenerator?.stopTone()
+                        isContinuousPlaying = false
+                    }
+                    delay(100)
+                } else if (dist <= 20) {
+                    if (!isContinuousPlaying) {
+                        toneGenerator.startTone(ToneGenerator.TONE_DTMF_8)
+                        isContinuousPlaying = true
+                    }
+                    delay(100)
+                } else {
+                    if (isContinuousPlaying) {
+                        toneGenerator.stopTone()
+                        isContinuousPlaying = false
+                    }
+                    val factor = (dist - 21) / 44f
+                    val pausaMs = (45L + (factor * 455f).toLong()).coerceIn(45L, 500L)
+                    val duracionPitidoMs = 65
+
+                    toneGenerator.startTone(ToneGenerator.TONE_PROP_BEEP, duracionPitidoMs)
+                    delay(duracionPitidoMs + pausaMs)
+                }
+            }
+        } finally {
+            if (isContinuousPlaying) {
+                toneGenerator?.stopTone()
+            }
+        }
+    }
+
+    val detections = detectionResults?.detections().orEmpty()
+    val closestInfo = if (distanceCm in 5..350) {
+        obtenerObjetoMasCercano(detections, imageSize.first, imageSize.second)
+    } else {
+        null
     }
 
     Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
@@ -252,13 +353,14 @@ fun MainCameraScreen() {
         }
 
         BoundingBoxOverlay(
-            results = detectionResults,
+            detections = detections,
+            closestDetection = closestInfo?.first,
             imageWidth = imageSize.first,
             imageHeight = imageSize.second,
             distanceCm = distanceCm
         )
 
-        // Barra superior: FPS, control del buzzer y selector de cámara
+        // Barra superior: FPS, control de sonido y selector de cámara
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -280,28 +382,13 @@ fun MainCameraScreen() {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!usarCamaraLocal) {
                     Button(
-                        onClick = {
-                            val nextMute = !buzzerMuted
-                            buzzerMuted = nextMute
-                            scope.launch(Dispatchers.IO) {
-                                try {
-                                    val client = OkHttpClient.Builder()
-                                        .connectTimeout(400, TimeUnit.MILLISECONDS)
-                                        .build()
-                                    val req = Request.Builder()
-                                        .url("$urlBuzzerBase?mute=${if (nextMute) 1 else 0}")
-                                        .build()
-                                    client.newCall(req).execute().close()
-                                } catch (_: Exception) {
-                                }
-                            }
-                        },
+                        onClick = { soundMuted = !soundMuted },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (buzzerMuted) Color(0xCC757575) else Color(0xCC43A047)
+                            containerColor = if (soundMuted) Color(0xCC757575) else Color(0xCC43A047)
                         )
                     ) {
                         Text(
-                            text = if (buzzerMuted) "Buzzer: OFF" else "Buzzer: ON",
+                            text = if (soundMuted) "Sonido: OFF" else "Sonido: ON",
                             color = Color.White,
                             fontSize = 12.sp
                         )
@@ -325,18 +412,22 @@ fun MainCameraScreen() {
             }
         }
 
-        // Alerta inferior sincronizada con los umbrales del buzzer (<= 65 cm pita, <= 20 cm fijo)
-        if (distanceCm in 2..400) {
+        // Alerta inferior: muestra distancia y el posible objeto detectado en ese rango
+        if (distanceCm in 5..350) {
             val metros = String.format(Locale.US, "%.2f", distanceCm / 100f)
+            val nombreObjeto = closestInfo?.second
+            val sujeto = nombreObjeto ?: "Obstáculo"
+
             val alertColor = when {
-                distanceCm <= 20 -> Color(0xE6D32F2F)   // Rojo intenso: pitido continuo
-                distanceCm <= 65 -> Color(0xDDF57C00)  // Naranja: pitido intermitente acelerado
-                else -> Color(0xCC2E7D32)               // Verde: más de 65 cm (sin pitido)
+                distanceCm <= 20 -> Color(0xE6D32F2F)
+                distanceCm <= 65 -> Color(0xDDF57C00)
+                else -> Color(0xCC2E7D32)
             }
             val mensaje = when {
-                distanceCm <= 20 -> "¡ALTO! Obstáculo a $metros m ($distanceCm cm)"
-                distanceCm <= 65 -> "¡PRECAUCIÓN! A $metros m ($distanceCm cm)"
-                else -> "Distancia segura: $metros m"
+                distanceCm <= 20 -> "¡ALTO! $sujeto a $metros m ($distanceCm cm)"
+                distanceCm <= 65 -> "¡PRECAUCIÓN! $sujeto a $metros m ($distanceCm cm)"
+                nombreObjeto != null -> "$nombreObjeto detectado a $metros m"
+                else -> "Distancia libre: $metros m"
             }
 
             Box(
@@ -421,7 +512,8 @@ fun CameraXView(onFrameCaptured: (Bitmap) -> Unit) {
 
 @Composable
 fun BoundingBoxOverlay(
-    results: ObjectDetectorResult?,
+    detections: List<Detection>,
+    closestDetection: Detection?,
     imageWidth: Int,
     imageHeight: Int,
     distanceCm: Int
@@ -434,38 +526,6 @@ fun BoundingBoxOverlay(
             isFakeBoldText = true
             setShadowLayer(4f, 2f, 2f, android.graphics.Color.BLACK)
         }
-    }
-
-    val traducciones = remember {
-        mapOf(
-            "person" to "Persona",
-            "car" to "Auto",
-            "truck" to "Camioneta / Camión",
-            "bus" to "Autobús",
-            "motorcycle" to "Moto",
-            "bicycle" to "Bicicleta",
-            "dog" to "Perro",
-            "cat" to "Gato",
-            "chair" to "Silla",
-            "bench" to "Banca",
-            "fire hydrant" to "Hidrante",
-            "stop sign" to "Señal de alto",
-            "backpack" to "Mochila",
-            "suitcase" to "Maleta",
-            "potted plant" to "Maceta",
-            "bottle" to "Botella",
-            "cup" to "Vaso / Taza",
-            "cell phone" to "Celular",
-            "laptop" to "Laptop"
-        )
-    }
-
-    val detections = results?.detections().orEmpty()
-
-    val closestDetection = if (distanceCm in 2..400) {
-        detections.maxByOrNull { it.boundingBox().bottom }
-    } else {
-        null
     }
 
     Canvas(modifier = Modifier.fillMaxSize()) {
@@ -496,8 +556,7 @@ fun BoundingBoxOverlay(
 
             detection.categories().firstOrNull()?.let { category ->
                 val rawName = category.categoryName().lowercase(Locale.ROOT)
-                val label = traducciones[rawName] ?: category.categoryName()
-                val porcentaje = (category.score() * 100).toInt()
+                val label = TRADUCCIONES_OBJETOS[rawName] ?: category.categoryName()
 
                 val textoDistancia = if (isClosest) {
                     val metros = String.format(Locale.US, "%.2f", distanceCm / 100f)
@@ -506,7 +565,7 @@ fun BoundingBoxOverlay(
                     ""
                 }
 
-                val texto = "$label $porcentaje%$textoDistancia"
+                val texto = "$label$textoDistancia"
                 drawContext.canvas.nativeCanvas.drawText(
                     texto,
                     left,
@@ -524,6 +583,7 @@ class ObjectDetectorHelper(
 ) {
     private var objectDetector: ObjectDetector? = null
     private var lastTimestamp = 0L
+    private val isBusy = AtomicBoolean(false)
 
     init {
         val baseOptions = BaseOptions.builder()
@@ -533,12 +593,14 @@ class ObjectDetectorHelper(
         val options = ObjectDetector.ObjectDetectorOptions.builder()
             .setBaseOptions(baseOptions)
             .setRunningMode(RunningMode.LIVE_STREAM)
-            .setMaxResults(8)
-            .setScoreThreshold(0.38f)
+            .setMaxResults(6)
+            .setScoreThreshold(0.40f)
             .setResultListener { result, inputImage ->
+                isBusy.set(false)
                 onResults(result, inputImage.width, inputImage.height)
             }
             .setErrorListener { e ->
+                isBusy.set(false)
                 e.printStackTrace()
             }
             .build()
@@ -547,12 +609,19 @@ class ObjectDetectorHelper(
     }
 
     fun detectLiveStream(bitmap: Bitmap) {
-        val now = SystemClock.uptimeMillis()
-        val timestamp = if (now <= lastTimestamp) lastTimestamp + 1 else now
-        lastTimestamp = timestamp
+        if (!isBusy.compareAndSet(false, true)) return
 
-        val mpImage = BitmapImageBuilder(bitmap).build()
-        objectDetector?.detectAsync(mpImage, timestamp)
+        try {
+            val now = SystemClock.uptimeMillis()
+            val timestamp = if (now <= lastTimestamp) lastTimestamp + 1 else now
+            lastTimestamp = timestamp
+
+            val mpImage = BitmapImageBuilder(bitmap).build()
+            objectDetector?.detectAsync(mpImage, timestamp)
+        } catch (e: Exception) {
+            isBusy.set(false)
+            e.printStackTrace()
+        }
     }
 
     fun close() {
